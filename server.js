@@ -1,9 +1,10 @@
 // ════════════════════════════════════════════
 // EduTrack AI — Backend Server (v2: Multi-School + Login)
 // ════════════════════════════════════════════
-// What's new compared to the old server.js:
-//   1. A real database (SQLite, stored in one file: edutrack.db) — no more
-//      losing data when a browser's storage is cleared.
+// What this does:
+//   1. Real, permanent storage — schools and students are saved to a file
+//      called data.json sitting next to this server, not in the school's
+//      browser. Clearing browser data no longer loses anything.
 //   2. Login support — each school has a username + password. Logging in
 //      gives back a "token" (like a temporary pass) that proves who they
 //      are on every later request, so School A can never see School B's
@@ -13,11 +14,19 @@
 //
 // You (the owner) create each school's login using the /admin/create-school
 // route below — schools never sign themselves up.
+//
+// Storage note: this uses a plain JSON file instead of a SQL database
+// (like SQLite). For a handful of schools and a few hundred students each,
+// this is genuinely enough — it avoids a class of deployment problems that
+// SQL database packages can run into on some hosting platforms (they need
+// to compile native code during install, which can fail). A JSON file
+// needs no compiling at all, so it just works everywhere, every time.
 // ════════════════════════════════════════════
 
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
+const fs = require('fs');
+const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
@@ -27,15 +36,7 @@ const app = express();
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || '*';
 const PORT = process.env.PORT || 3000;
-
-// JWT_SECRET signs login tokens so they can't be forged. Render generates
-// a random one for you automatically if you don't set it — see
-// DEPLOY_README_V2.md for how that works.
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-in-production-please';
-
-// ADMIN_PASSWORD protects the /admin routes (creating new schools).
-// This is YOUR password, not a school's. Set it in Render's Environment
-// Variables, same place as your Anthropic key.
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
 if (!ANTHROPIC_API_KEY) {
@@ -45,38 +46,30 @@ if (!ADMIN_PASSWORD) {
   console.error('❌ ADMIN_PASSWORD is not set. You will not be able to create new school logins until you set it.');
 }
 
-// ── DATABASE SETUP ──
-// This creates (or opens, if it already exists) a single file called
-// edutrack.db sitting next to this server. All schools' data lives in
-// here, kept separate by school_id on every table.
-const db = new Database('edutrack.db');
-db.pragma('journal_mode = WAL'); // safer for concurrent reads/writes
+// ── STORAGE ──
+const DATA_FILE = path.join(__dirname, 'data.json');
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS schools (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    school_name TEXT,
-    school_addr TEXT,
-    principal TEXT,
-    motto TEXT,
-    logo TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
+function loadData() {
+  if (!fs.existsSync(DATA_FILE)) {
+    return { schools: [], students: [], nextSchoolId: 1 };
+  }
+  try {
+    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch (err) {
+    console.error('⚠️ Could not parse data.json — starting fresh. Original file backed up as data.json.bak');
+    if (fs.existsSync(DATA_FILE)) fs.copyFileSync(DATA_FILE, DATA_FILE + '.bak');
+    return { schools: [], students: [], nextSchoolId: 1 };
+  }
+}
 
-  CREATE TABLE IF NOT EXISTS students (
-    id TEXT PRIMARY KEY,
-    school_id INTEGER NOT NULL,
-    data TEXT NOT NULL,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (school_id) REFERENCES schools(id)
-  );
+function saveData(data) {
+  const tmpFile = DATA_FILE + '.tmp';
+  fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+  fs.renameSync(tmpFile, DATA_FILE);
+}
 
-  CREATE INDEX IF NOT EXISTS idx_students_school ON students(school_id);
-`);
-
-console.log('Database ready: edutrack.db');
+let data = loadData();
+console.log(`Database ready: data.json (${data.schools.length} schools, ${data.students.length} students)`);
 
 // ── MIDDLEWARE ──
 app.use(express.json({ limit: '5mb' }));
@@ -134,12 +127,14 @@ app.get('/', (req, res) => {
     service: 'EduTrack AI backend (v2)',
     apiKeyConfigured: Boolean(ANTHROPIC_API_KEY),
     adminConfigured: Boolean(ADMIN_PASSWORD),
+    schools: data.schools.length,
   });
 });
 
 // ════════════════════════════════════════════
 // ADMIN ROUTES
 // ════════════════════════════════════════════
+
 app.post('/admin/create-school', requireAdmin, (req, res) => {
   const { username, password, schoolName } = req.body || {};
   if (!username || !password) {
@@ -149,21 +144,32 @@ app.post('/admin/create-school', requireAdmin, (req, res) => {
     return res.status(400).json({ error: 'Password should be at least 6 characters.' });
   }
 
-  const existing = db.prepare('SELECT id FROM schools WHERE username = ?').get(username);
+  const existing = data.schools.find(s => s.username === username);
   if (existing) {
     return res.status(409).json({ error: 'That username is already taken. Choose another.' });
   }
 
-  const passwordHash = bcrypt.hashSync(password, 10);
-  const result = db.prepare(
-    'INSERT INTO schools (username, password_hash, school_name) VALUES (?, ?, ?)'
-  ).run(username, passwordHash, schoolName || '');
+  const newSchool = {
+    id: data.nextSchoolId++,
+    username,
+    password_hash: bcrypt.hashSync(password, 10),
+    school_name: schoolName || '',
+    school_addr: '',
+    principal: '',
+    motto: '',
+    logo: null,
+    created_at: new Date().toISOString(),
+  };
+  data.schools.push(newSchool);
+  saveData(data);
 
-  res.json({ success: true, schoolId: result.lastInsertRowid, username });
+  res.json({ success: true, schoolId: newSchool.id, username });
 });
 
 app.get('/admin/schools', requireAdmin, (req, res) => {
-  const rows = db.prepare('SELECT id, username, school_name, created_at FROM schools').all();
+  const rows = data.schools.map(s => ({
+    id: s.id, username: s.username, school_name: s.school_name, created_at: s.created_at,
+  }));
   res.json({ schools: rows });
 });
 
@@ -172,15 +178,17 @@ app.post('/admin/reset-password', requireAdmin, (req, res) => {
   if (!username || !newPassword || newPassword.length < 6) {
     return res.status(400).json({ error: 'username and a newPassword (6+ chars) are required.' });
   }
-  const passwordHash = bcrypt.hashSync(newPassword, 10);
-  const result = db.prepare('UPDATE schools SET password_hash = ? WHERE username = ?').run(passwordHash, username);
-  if (result.changes === 0) return res.status(404).json({ error: 'No school found with that username.' });
+  const school = data.schools.find(s => s.username === username);
+  if (!school) return res.status(404).json({ error: 'No school found with that username.' });
+  school.password_hash = bcrypt.hashSync(newPassword, 10);
+  saveData(data);
   res.json({ success: true });
 });
 
 // ════════════════════════════════════════════
 // SCHOOL LOGIN
 // ════════════════════════════════════════════
+
 app.post('/auth/login', (req, res) => {
   const ip = req.ip || 'unknown';
   if (isRateLimited('login:' + ip)) {
@@ -192,7 +200,7 @@ app.post('/auth/login', (req, res) => {
     return res.status(400).json({ error: 'Username and password are required.' });
   }
 
-  const school = db.prepare('SELECT * FROM schools WHERE username = ?').get(username);
+  const school = data.schools.find(s => s.username === username);
   if (!school || !bcrypt.compareSync(password, school.password_hash)) {
     return res.status(401).json({ error: 'Incorrect username or password.' });
   }
@@ -215,10 +223,11 @@ app.post('/auth/login', (req, res) => {
 // ════════════════════════════════════════════
 // SCHOOL DATA ROUTES
 // ════════════════════════════════════════════
+
 app.get('/api/school-data', requireSchoolAuth, (req, res) => {
-  const school = db.prepare('SELECT * FROM schools WHERE id = ?').get(req.schoolId);
-  const studentRows = db.prepare('SELECT data FROM students WHERE school_id = ?').all(req.schoolId);
-  const students = studentRows.map(row => JSON.parse(row.data));
+  const school = data.schools.find(s => s.id === req.schoolId);
+  if (!school) return res.status(404).json({ error: 'School not found.' });
+  const students = data.students.filter(s => s.school_id === req.schoolId).map(s => s.payload);
 
   res.json({
     schoolDetails: {
@@ -233,16 +242,23 @@ app.get('/api/school-data', requireSchoolAuth, (req, res) => {
 });
 
 app.post('/api/school-details', requireSchoolAuth, (req, res) => {
+  const school = data.schools.find(s => s.id === req.schoolId);
+  if (!school) return res.status(404).json({ error: 'School not found.' });
   const { name, addr, principal, motto } = req.body || {};
-  db.prepare(
-    'UPDATE schools SET school_name = ?, school_addr = ?, principal = ?, motto = ? WHERE id = ?'
-  ).run(name || '', addr || '', principal || '', motto || '', req.schoolId);
+  school.school_name = name || '';
+  school.school_addr = addr || '';
+  school.principal = principal || '';
+  school.motto = motto || '';
+  saveData(data);
   res.json({ success: true });
 });
 
 app.post('/api/school-logo', requireSchoolAuth, (req, res) => {
+  const school = data.schools.find(s => s.id === req.schoolId);
+  if (!school) return res.status(404).json({ error: 'School not found.' });
   const { logo } = req.body || {};
-  db.prepare('UPDATE schools SET logo = ? WHERE id = ?').run(logo || null, req.schoolId);
+  school.logo = logo || null;
+  saveData(data);
   res.json({ success: true });
 });
 
@@ -251,12 +267,11 @@ app.post('/api/students', requireSchoolAuth, (req, res) => {
   if (!student || !student.id) {
     return res.status(400).json({ error: 'Student data with an id is required.' });
   }
-  const data = JSON.stringify(student);
-  db.prepare(`
-    INSERT INTO students (id, school_id, data, updated_at)
-    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = CURRENT_TIMESTAMP
-  `).run(student.id, req.schoolId, data);
+  const existingIndex = data.students.findIndex(s => s.id === student.id && s.school_id === req.schoolId);
+  const record = { id: student.id, school_id: req.schoolId, payload: student, updated_at: new Date().toISOString() };
+  if (existingIndex >= 0) data.students[existingIndex] = record;
+  else data.students.push(record);
+  saveData(data);
   res.json({ success: true });
 });
 
@@ -265,25 +280,25 @@ app.post('/api/students/bulk', requireSchoolAuth, (req, res) => {
   if (!Array.isArray(students)) {
     return res.status(400).json({ error: 'students must be an array.' });
   }
-  const insert = db.prepare(`
-    INSERT INTO students (id, school_id, data, updated_at)
-    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = CURRENT_TIMESTAMP
-  `);
-  const insertMany = db.transaction((rows) => {
-    for (const s of rows) insert.run(s.id, req.schoolId, JSON.stringify(s));
-  });
-  insertMany(students);
+  for (const s of students) {
+    const existingIndex = data.students.findIndex(row => row.id === s.id && row.school_id === req.schoolId);
+    const record = { id: s.id, school_id: req.schoolId, payload: s, updated_at: new Date().toISOString() };
+    if (existingIndex >= 0) data.students[existingIndex] = record;
+    else data.students.push(record);
+  }
+  saveData(data);
   res.json({ success: true, count: students.length });
 });
 
 app.delete('/api/students/:id', requireSchoolAuth, (req, res) => {
-  db.prepare('DELETE FROM students WHERE id = ? AND school_id = ?').run(req.params.id, req.schoolId);
+  data.students = data.students.filter(s => !(s.id === req.params.id && s.school_id === req.schoolId));
+  saveData(data);
   res.json({ success: true });
 });
 
 app.delete('/api/students', requireSchoolAuth, (req, res) => {
-  db.prepare('DELETE FROM students WHERE school_id = ?').run(req.schoolId);
+  data.students = data.students.filter(s => s.school_id !== req.schoolId);
+  saveData(data);
   res.json({ success: true });
 });
 
@@ -317,12 +332,12 @@ app.post('/api/generate', requireSchoolAuth, async (req, res) => {
         messages: [{ role: 'user', content: prompt }],
       }),
     });
-    const data = await response.json();
+    const responseData = await response.json();
     if (!response.ok) {
-      console.error('Anthropic API error:', data);
-      return res.status(response.status).json({ error: data.error?.message || 'AI service returned an error.' });
+      console.error('Anthropic API error:', responseData);
+      return res.status(response.status).json({ error: responseData.error?.message || 'AI service returned an error.' });
     }
-    res.json({ text: data.content?.[0]?.text || '' });
+    res.json({ text: responseData.content?.[0]?.text || '' });
   } catch (err) {
     console.error('Request to Anthropic failed:', err);
     res.status(502).json({ error: 'Could not reach the AI service. Please try again shortly.' });
