@@ -1,7 +1,7 @@
 {
   "name": "edutrack-ai-backend",
-  "version": "2.0.0",
-  "description": "EduTrack AI backend — multi-school login, database storage, and AI proxy.",
+  "version": "2.1.0",
+  "description": "EduTrack AI backend — multi-school login, file-based storage, and AI proxy.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,7 +12,6 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5",
-    "better-sqlite3": "^11.3.0",
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2"
   }
